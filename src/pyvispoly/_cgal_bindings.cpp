@@ -30,6 +30,10 @@
 #include <CGAL/create_straight_skeleton_2.h>
 //  fmt
 #include <fmt/core.h>
+#include <variant>
+using namespace pybind11;
+namespace py = pybind11;
+
 
 // Define CGAL types
 using Kernel = CGAL::Epeck; // Exact Predicates Exact Constructions Kernel
@@ -41,8 +45,14 @@ using Segment2 = Kernel::Segment_2;
 using Traits_2 = CGAL::Arr_segment_traits_2<Kernel>;
 using Arrangement_2 = CGAL::Arrangement_2<Traits_2>;
 using Halfedge_const_handle = Arrangement_2::Halfedge_const_handle;
+using Halfedge_handle = Arrangement_2::Halfedge_handle;
+using Face_const_handle = Arrangement_2::Face_const_handle;
 using Face_handle = Arrangement_2::Face_handle;
+using Vertex_handle = Arrangement_2::Vertex_handle;
+using Vertex_const_handle = Arrangement_2::Vertex_const_handle;
 using PointLocation = CGAL::Arr_naive_point_location<Arrangement_2>;
+typedef CGAL::Rotational_sweep_visibility_2<Arrangement_2, CGAL::Tag_true>
+      RSV;
 // Define the used visibility class
 typedef CGAL::Triangular_expansion_visibility_2<
     Arrangement_2, /*Regularization*/ CGAL::Tag_true>
@@ -336,10 +346,152 @@ std::vector<Polygon2WithHoles> repair(const Polygon2WithHoles &poly) {
   return result;
 }
 
+void insert_segments_in_arr(Arrangement_2& arr, std::vector<Segment2>& segs) {
+    CGAL::insert(arr, segs.begin(), segs.end());
+}
+void insert_segment_in_arr(Arrangement_2& self, Segment2& segment) {
+    CGAL::insert(self, segment);
+}
+
+Halfedge_handle insert_non_intersecting_curve_in_arr(Arrangement_2& arr, Segment2& seg) {
+    return CGAL::insert_non_intersecting_curve(arr, seg);
+}
+
+void insert_non_intersecting_curves_in_arr(Arrangement_2& arr, std::vector<Segment2>& segs) {
+    CGAL::insert_non_intersecting_curves(arr, segs.begin(), segs.end());
+}
+
+Vertex_handle insert_point_in_arr(Arrangement_2 & arr, Point& p) {
+    Vertex_handle h = CGAL::insert_point(arr, p);
+    return h;
+}
+
+bool remove_vertex_from_arr(Arrangement_2& arr, Vertex_handle v) {
+    return CGAL::remove_vertex(arr, v);
+}
+
+Face_handle remove_edge_from_arr(Arrangement_2& arr, Halfedge_handle h) {
+    return CGAL::remove_edge(arr, h);
+}
+
+py::object find_in_arrangement(Arrangement_2& arr, Point& query_point) {
+    CGAL::Arr_naive_point_location<Arrangement_2> pl(arr);
+    CGAL::Arr_point_location_result<Arrangement_2>::Type obj = pl.locate(query_point);
+
+    const Vertex_const_handle*   v;
+    const Halfedge_const_handle* e;
+    const Face_const_handle*     f;
+
+    // Casting to non - const types since they are only defined in skgeom
+    if ((f = std::get_if<Face_const_handle>(&obj)))
+    {
+        // Note it's very important to return `Handles` here.
+        return py::cast(*(Face_handle*) f);
+    }
+    else if ((e = std::get_if<Halfedge_const_handle>(&obj)))
+    {
+        return py::cast(*(Halfedge_handle*) e);
+    }
+    else if ((v = std::get_if<Vertex_const_handle>(&obj)))
+    {
+        return py::cast(*(Vertex_handle*) v);
+    }
+    return py::none();
+}
+
+namespace skgeom
+{
+
+    template <typename Iterator, return_value_policy Policy>
+    struct circulator_state {
+        Iterator it;
+        bool first;
+    };
+
+    template <return_value_policy Policy = return_value_policy::reference_internal,
+              typename HandleType = void,
+              typename Iterator,
+              typename Sentinel,
+              typename ValueType = decltype(*std::declval<Iterator>()),
+              typename... Extra>
+    iterator make_handle_iterator(Iterator first, Sentinel last, Extra &&... extra) {
+        typedef detail::iterator_state<
+            detail::iterator_access<Iterator>, Policy, Iterator, Sentinel, ValueType
+        > state;
+
+        if (!detail::get_type_info(typeid(state), false)) {
+            class_<state>(handle(), "iterator", pybind11::module_local())
+                .def("__iter__", [](state &s) -> state& { return s; })
+                .def("__next__", [](state &s) -> HandleType {
+                    if (!s.first_or_done)
+                        ++s.it;
+                    else
+                        s.first_or_done = false;
+                    if (s.it == s.end) {
+                        s.first_or_done = true;
+                        throw stop_iteration();
+                    }
+                    // do not dereference here, just cast to handle
+                    return HandleType(s.it);
+                }, std::forward<Extra>(extra)..., Policy);
+        }
+
+        return cast(state{first, last, true});
+    }
+
+    template <return_value_policy Policy = return_value_policy::reference_internal,
+              typename HandleType = void,
+              typename Iterator,
+              typename ValueType = decltype(*std::declval<Iterator>()),
+              typename... Extra>
+    iterator make_circulator(Iterator first, Extra &&... extra) {
+        typedef circulator_state<Iterator, Policy> state;
+
+        if (!detail::get_type_info(typeid(state), false)) {
+            class_<state>(handle(), "circulator", pybind11::module_local())
+                .def("__iter__", [](state &s) -> state& { return s; })
+                .def("__next__", [](state &s) -> HandleType {
+                    if (s.first) { return HandleType(s.it); }
+                    else { return HandleType(++s.it); };
+                }, std::forward<Extra>(extra)..., Policy);
+        }
+
+        return cast(state{first});
+    }
+
+    template <return_value_policy Policy = return_value_policy::reference_internal,
+              typename Iterator,
+              typename Sentinel,
+              typename... Extra>
+    iterator make_hole_iterator(Iterator first, Sentinel last, Extra &&... extra) {
+        typedef detail::iterator_state<
+            detail::iterator_access<Iterator>, Policy, Iterator, Sentinel,
+            decltype(*std::declval<Iterator>())
+        > state;
+
+        if (!detail::get_type_info(typeid(state), false)) {
+            class_<state>(handle(), "iterator", pybind11::module_local())
+                .def("__iter__", [](state &s) -> state& { return s; })
+                .def("__next__", [](state &s) {
+                    if (!s.first_or_done)
+                        ++s.it;
+                    else
+                        s.first_or_done = false;
+                    if (s.it == s.end) {
+                        s.first_or_done = true;
+                        throw stop_iteration();
+                    }
+                    return skgeom::make_circulator<Policy, Halfedge_const_handle>(*s.it);
+                }, std::forward<Extra>(extra)..., Policy);
+        }
+
+        return cast(state{first, last, true});
+    }
+}
+
 // Getting this name right is important! It has to equal the name in the
 // CMakeLists.txt.
 PYBIND11_MODULE(_cgal_bindings, m) {
-  namespace py = pybind11;
   m.doc() = "Example of PyBind11 and CGAL."; // optional module docstring
 
   // Exact numbers
@@ -383,6 +535,12 @@ PYBIND11_MODULE(_cgal_bindings, m) {
         return fmt::format("({}, {})", CGAL::to_double(p.x()),
                            CGAL::to_double(p.y()));
       });
+
+    // Segments
+    py::class_<Segment2>(m, "Segment", "A line segment in CGAL.")
+        .def(py::init<const Point, const Point>())
+        .def("source", [](const Segment2 &s) { return s.source(); })
+        .def("target", [](const Segment2 &s) { return s.target(); });
 
   // Polygons
   py::class_<Polygon2>(m, "Polygon", "A simple polygon in CGAL.")
@@ -555,6 +713,81 @@ PYBIND11_MODULE(_cgal_bindings, m) {
            &VisibilityPolygonCalculator::is_feasible_query_point,
            py::arg("query_point"),
            "Check if the query point is within the polygon.");
+
+  py::class_<Arrangement_2>(m, "Arrangement", "A 2D segments arrangement in CGAL.")
+      .def(py::init<>())
+      .def_property_readonly("halfedges", [](Arrangement_2& s) {
+         return skgeom::make_handle_iterator<py::return_value_policy::reference_internal, Halfedge_handle>(s.halfedges_begin(), s.halfedges_end());
+      }, py::keep_alive<0, 1>())
+      .def_property_readonly("faces", [](Arrangement_2& s) {
+         return skgeom::make_handle_iterator<py::return_value_policy::reference_internal, Face_handle>(s.faces_begin(), s.faces_end());
+      }, py::keep_alive<0, 1>())
+      .def_property_readonly("vertices", [](Arrangement_2& s) {
+         return skgeom::make_handle_iterator<py::return_value_policy::reference_internal, Vertex_handle>(s.vertices_begin(), s.vertices_end());
+      }, py::keep_alive<0, 1>())
+      .def("insert_non_intersecting_curve", &insert_non_intersecting_curve_in_arr)
+      .def("insert_non_intersecting_curves", &insert_non_intersecting_curves_in_arr)
+      .def("insert", &insert_segment_in_arr)
+      .def("insert", &insert_segments_in_arr)
+      .def("unbounded_face", static_cast<Face_handle (Arrangement_2::*)()>(&Arrangement_2::unbounded_face))
+      .def("address", [](Arrangement_2& self) { std::cout << (void*) &self << std::endl; })
+      .def("insert_point", &insert_point_in_arr)
+      .def("remove_vertex", &remove_vertex_from_arr)
+      .def("remove_edge", &remove_edge_from_arr)
+      .def("find", &find_in_arrangement)
+  ;
+
+    // Use Vertex_handle as the primary type and access members using ->
+    py::class_<Vertex_handle>(m, "Vertex")
+        .def("point", [](Vertex_handle self) { return self->point(); })
+        .def_property_readonly("incident_halfedges", [](Vertex_handle self) {
+            return skgeom::make_circulator<py::return_value_policy::reference_internal, Halfedge_handle>(self->incident_halfedges());
+        }, py::keep_alive<0, 1>())
+    ;
+
+    // Use Halfedge_handle as the primary type and access members using ->
+    py::class_<Halfedge_handle>(m, "Halfedge")
+        .def("prev", [](Halfedge_handle self) { return self->prev(); })
+        .def("next", [](Halfedge_handle self) { return self->next(); })
+        .def("twin", [](Halfedge_handle self) { return self->twin(); })
+        .def("source", [](Halfedge_handle self) { return self->source(); })
+        .def("target", [](Halfedge_handle self) { return self->target(); })
+        .def("curve", [](Halfedge_handle self) -> Segment2 {
+            return self->curve();
+        })
+        .def("face", [](Halfedge_handle self) { return self->face(); })
+    ;
+
+    // Use Face_handle as the primary type and access members using ->
+    py::class_<Face_handle>(m, "Face")
+        .def("is_unbounded", [](Face_handle self) -> bool { return self->is_unbounded(); })
+        .def("has_outer_ccb", [](Face_handle self) { return self->has_outer_ccb(); })
+        .def("number_of_holes", [](Face_handle self) { return self->number_of_holes(); })
+        .def("number_of_isolated_vertices", [](Face_handle self) -> int { return self->number_of_isolated_vertices(); })
+        .def_property_readonly("isolated_vertices", [](Face_handle self) {
+            return py::make_iterator(self->isolated_vertices_begin(), self->isolated_vertices_end());
+        }, py::keep_alive<0, 1>())
+        .def_property_readonly("outer_ccb", [](Face_handle self) {
+            return skgeom::make_circulator<py::return_value_policy::reference_internal, Halfedge_handle>(self->outer_ccb());
+        }, py::keep_alive<0, 1>())
+        .def_property_readonly("holes", [](Face_handle self) {
+            return skgeom::make_hole_iterator(self->holes_begin(), self->holes_end());
+        }, py::keep_alive<0, 1>())
+    ;
+
+  py::class_<RSV>(m, "RotationalSweepVisibility")
+      .def(py::init<const Arrangement_2&>())
+      .def("compute_visibility", [](RSV& rsv, Point query_point, Halfedge_handle he) {
+          Arrangement_2 output_arr;
+          rsv.compute_visibility(query_point, he, output_arr);
+          return output_arr;
+      })
+      .def("compute_visibility", [](RSV& rsv, Point query_point, Face_handle fh) {
+          Arrangement_2 output_arr;
+          rsv.compute_visibility(query_point, fh, output_arr);
+          return output_arr;
+      })
+  ;
 
   m.def("repair", &repair,
         "Repair a polygon with holes that is self "
